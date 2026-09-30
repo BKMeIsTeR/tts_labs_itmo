@@ -1,183 +1,336 @@
-"""Build pause predictor training data — lab 2.
+"""Prepare RUSLAN data for pause prediction — lab 2.
 
-Joins the lab 1 normalized metadata with the MFA word alignment and writes one row per
-word to `data/RUSLAN_pause_metadata.csv`::
+The script combines:
+1) normalized metadata from lab 1;
+2) MFA word alignments from RUSLAN_align_v2.
 
-    id|label|label_raw|duration|is_last_word|is_pause_after|pause_duration|set
+The result is one row per word:
+id | label | label_raw | duration | is_last_word |
+is_pause_after | pause_duration | set
 
-Utterances whose id ends in 0 or 5 go to `test`, the rest to `train`.
+Compared with the original skeleton, this version performs a small amount
+of conservative cleanup:
+- silences shorter than 30 ms are not treated as pauses;
+- utterances shorter than 3 words are removed;
+- utterances with an implausibly high internal pause density (> 40%) are removed.
 
-Run from the lab directory::
-
-    python prepare_training_data.py
+We do NOT remove utterances simply because they contain no internal pause:
+a perfectly fluent sentence may legitimately have none.
 """
+
 import csv
-import glob
-import numpy as np
 import os
+from pathlib import Path
+
 import pandas as pd
 from praatio import textgrid
-import tqdm
+from tqdm import tqdm
 
-RUSLAN_META = '../../data/metadata_RUSLAN_22200_normalized.csv'
-ALIGN_DIR = '../../data/RUSLAN_align_v2/'
-RESULT_PATH = 'data/RUSLAN_pause_metadata.csv'
 
-def read_text_grids(ruslan: pd.DataFrame, align_root: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:   
-    """Read the MFA TextGrid of every utterance in `ruslan`.
+RUSLAN_META = "../../data/metadata_RUSLAN_22200_normalized.csv"
+ALIGN_DIR = "../../data/RUSLAN_align_v2"
+RESULT_PATH = "data/RUSLAN_pause_metadata.csv"
 
-    Args:
-        ruslan: Metadata with `id` and `nrm` columns.
-        align_root: Directory with `{id}.TextGrid` files.
+MIN_PAUSE_DURATION = 0.03   # 30 ms
+MIN_WORDS = 3
+MAX_PAUSE_DENSITY = 0.40
 
-    Returns:
-        Word intervals (`label`, `duration`, `id`; silence has label ``""``), phone
-        intervals (same columns; silence is ``"<SIL>"``), and one space-joined phone
-        string per metadata row (``""`` when the TextGrid is missing).
-    """
-    word_docs = []
-    phn_docs = []
-    phoneme_sequences = []
-    for wave_id, text in tqdm.tqdm(ruslan[['id', 'nrm']].values):
+
+def read_text_grids(
+    ruslan: pd.DataFrame,
+    align_root: str,
+) -> pd.DataFrame:
+    """Read the word tier from MFA TextGrid files."""
+
+    rows = []
+
+    for wave_id in tqdm(ruslan["id"], desc="Читаем TextGrid"):
+        path = os.path.join(align_root, f"{wave_id}.TextGrid")
+
+        if not os.path.exists(path):
+            continue
+
         try:
-            tg = textgrid.openTextgrid(os.path.join(align_root, wave_id+'.TextGrid'), True)
-        except:
-            phoneme_sequences.append('')
+            tg = textgrid.openTextgrid(path, includeEmptyIntervals=True)
+            words = tg.getTier("words").entries
+        except Exception:
             continue
-        words, phones = tg.tiers
 
-        words = words.entries
-        for i in words:
-            word_docs.append({'label':i.label, 'duration':i.end-i.start, 'id': wave_id})
-        
-        phoneme_sequences.append(' '.join([p.label for p in phones.entries]))
-        phones = phones.entries
-        for i in phones:
-            if i.label=='':
-                phn_docs.append({'label':'<SIL>', 'duration':i.end-i.start, 'id': wave_id})
-            else:
-                phn_docs.append({'label':i.label, 'duration':i.end-i.start, 'id': wave_id})
-    word_df = pd.DataFrame(word_docs)
-    phn_df = pd.DataFrame(phn_docs)
-    return word_df, phn_df, phoneme_sequences
+        for interval in words:
+            rows.append(
+                {
+                    "id": wave_id,
+                    "label": interval.label,
+                    "duration": float(interval.end - interval.start),
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
-def align_text_and_textgrid(tokens: pd.DataFrame, text: str) -> pd.DataFrame:
-    """Attach the original text form of each aligned word as `label_raw`.
+def align_text_and_textgrid(
+    tokens: pd.DataFrame,
+    text: str,
+) -> pd.DataFrame:
+    """Attach punctuation-preserving text tokens as label_raw.
 
-    MFA labels are lowercase and carry no punctuation. `label_raw` restores the case
-    and appends the punctuation that follows each word; text before the first word goes
-    to the first word. Silence intervals get ``"<SIL>"``.
-
-    Args:
-        tokens: Word intervals of one utterance, as returned by :func:`read_text_grids`.
-        text: Normalized text of the same utterance.
-
-    Returns:
-        `tokens` with a `label_raw` column, or `tokens` unchanged if a word is not
-        found in `text` — such utterances are dropped later.
+    MFA words are lowercase and do not keep punctuation.  This function
+    walks through the normalized sentence and attaches punctuation to the
+    preceding word.
     """
+
+    if len(tokens) == 0:
+        return tokens
+
+    tokens = tokens.copy()
     raw_tokens = []
-    text_lower = text.lower()
+
+    text_work = str(text)
+    text_lower = text_work.lower()
     previous_word = -1
-    for t, d, i in tokens[['label', 'duration', 'id']].values:
-        if t == '': # Empty, SIL token
-            raw_tokens.append('<SIL>')
+
+    for token in tokens["label"].astype(str):
+        # Empty TextGrid interval = silence.
+        if token == "":
+            raw_tokens.append("<SIL>")
             continue
-        splits = text_lower.split(t, maxsplit=1)
-        if len(splits)==1: # Does not found content!
-            print(f'Error aligning f{i}!')
-            print(t, text, tokens)
-            return tokens 
-        if previous_word == -1: 
-            raw_tokens.append(text[:len(splits[0]+t)].strip())
+
+        parts = text_lower.split(token.lower(), maxsplit=1)
+
+        # If MFA token cannot be found in normalized text, alignment is unsafe.
+        if len(parts) == 1:
+            return tokens
+
+        prefix = parts[0]
+
+        if previous_word == -1:
+            raw_tokens.append(
+                text_work[: len(prefix) + len(token)].strip()
+            )
         else:
-            raw_tokens[previous_word] += text[:len(splits[0])].strip()
-            raw_tokens.append(text[len(splits[0]):len(splits[0] + t)])
-        text_lower = splits[1]
-        text = text[len(splits[0] + t):]
-        previous_word = len(raw_tokens)-1
-    if len(text) and (previous_word>=0):
-        raw_tokens[previous_word] += text.strip()
-    tokens['label_raw'] = raw_tokens
+            raw_tokens[previous_word] += text_work[: len(prefix)].strip()
+            raw_tokens.append(
+                text_work[len(prefix): len(prefix) + len(token)]
+            )
+
+        consumed = len(prefix) + len(token)
+        text_work = text_work[consumed:]
+        text_lower = parts[1]
+        previous_word = len(raw_tokens) - 1
+
+    if text_work and previous_word >= 0:
+        raw_tokens[previous_word] += text_work.strip()
+
+    tokens["label_raw"] = raw_tokens
     return tokens
 
-def add_pause_labels(align: pd.DataFrame) -> pd.DataFrame:
-    """Mark which words are followed by a pause, and for how long.
 
-    Adds `is_last_word`, `is_pause_after` and `pause_duration` (seconds). Silence rows
-    themselves get ``False`` / ``0.0``; silence before the first word is ignored.
+def add_pause_labels(
+    align: pd.DataFrame,
+    min_pause_duration: float = MIN_PAUSE_DURATION,
+) -> pd.DataFrame:
+    """Move silence information onto the preceding word."""
 
-    Args:
-        align: Word intervals of one utterance, in order.
+    align = align.copy()
 
-    Returns:
-        `align` with the three label columns.
-    """
-    is_last_word = []
-    pause_after = []
-    pause_duration = []
+    is_last_word = [False] * len(align)
+    pause_after = [False] * len(align)
+    pause_duration = [0.0] * len(align)
+
     last_word = -1
-    for idx, (label, dur) in enumerate(align[['label', 'duration']].values):
-        if label == '':
-            if last_word>=0:
+
+    for idx, row in enumerate(align[["label", "duration"]].itertuples(index=False)):
+        label = str(row.label)
+        duration = float(row.duration)
+
+        if label == "":
+            if last_word >= 0 and duration >= min_pause_duration:
                 pause_after[last_word] = True
-                pause_duration[last_word] = dur
-            pause_after.append(False)
-            pause_duration.append(0.)
-            is_last_word.append(False)
+                pause_duration[last_word] = duration
         else:
-            pause_after.append(False)
-            pause_duration.append(0.)
-            is_last_word.append(False)
             last_word = idx
-    if last_word>=0:
+
+    if last_word >= 0:
         is_last_word[last_word] = True
-    align['is_last_word'] = is_last_word
-    align['is_pause_after'] = pause_after
-    align['pause_duration'] = pause_duration 
+
+    align["is_last_word"] = is_last_word
+    align["is_pause_after"] = pause_after
+    align["pause_duration"] = pause_duration
+
     return align
-    
+
+
+def is_good_utterance(group: pd.DataFrame) -> tuple[bool, str]:
+    """Simple segmentation quality filter."""
+
+    words = group[group["label"].astype(str) != ""]
+
+    if len(words) < MIN_WORDS:
+        return False, "too_short"
+
+    # The last word is excluded because the final silence belongs to the
+    # recording boundary rather than natural within-sentence prosody.
+    internal = words[words["is_last_word"] == 0]
+
+    if len(internal) == 0:
+        return False, "too_short"
+
+    pause_density = internal["is_pause_after"].mean()
+
+    if pause_density > MAX_PAUSE_DENSITY:
+        return False, "too_dense"
+
+    return True, "ok"
+
 
 def main() -> None:
-    """Read metadata and alignments, label pauses, split into train/test and save."""
-    ruslan =pd.read_csv(f'{RUSLAN_META}', sep='|', names=['id', 'raw', 'nrm'], quoting=csv.QUOTE_NONE)
-    word_df, _, _ = read_text_grids(ruslan, ALIGN_DIR)
+    Path("data").mkdir(exist_ok=True)
 
-    
-    #Additional normalization to ensure good alignment
-    word_df.label = word_df.label.str.replace('‐', '-') # differen hyphen symbols
-    word_df.label = word_df.label.str.replace('‑', '-')
-    ruslan.nrm = ruslan.nrm.str.replace('‐', '-')
-    ruslan.nrm = ruslan.nrm.str.replace('‑', '-')
-    ruslan.nrm = ruslan.nrm.str.replace('’', "'") # Mfa replaces ’ by '
-    ruslan.nrm = ruslan.nrm.str.replace('\\((.*?)\\)', '[bracketed]', regex=True) # Mfa spells () and <> text as [bracketed]
-    ruslan.nrm = ruslan.nrm.str.replace('\\<(.*?)\\>', '[bracketed]', regex=True)
+    ruslan = pd.read_csv(
+        RUSLAN_META,
+        sep="|",
+        names=["id", "raw", "nrm"],
+        encoding="utf-8",
+        quoting=csv.QUOTE_NONE,
+    )
 
-    #Aligning TextGrid-normalised tokens and text, including punctuation
-    aligns = []
-    for n, i in tqdm.tqdm(ruslan[['nrm', 'id']].values):
-        tokens = word_df[word_df.id==i]
-        aligns.append(align_text_and_textgrid(tokens, n))
+    print(f"Нормализованных utterances из ЛР1: {len(ruslan)}")
 
-    # Creating labels for pause predictor training
-    aligns = [add_pause_labels(a) for a in aligns]
+    word_df = read_text_grids(ruslan, ALIGN_DIR)
 
-    # Creating dataframe
-    pause_df = pd.concat(aligns)
-    
-    pause_df = pause_df[pause_df.label_raw!='<SIL>'] # Removing pause tokens -- all information about pauses is in word tokens now
-    pause_df = pause_df[pause_df.label_raw.notna()] # Removing all the files, who failed to be aligned
-    pause_df = pause_df.reset_index(drop=True) # Reseting the index after filtering
-    
-    pause_df.is_last_word = pause_df.is_last_word.astype(int) # Casting bool fields into int
-    pause_df.is_pause_after = pause_df.is_pause_after.astype(int) #
+    # MFA and our normalizer may use slightly different Unicode hyphens.
+    word_df["label"] = (
+        word_df["label"]
+        .astype(str)
+        .str.replace("‐", "-", regex=False)
+        .str.replace("‑", "-", regex=False)
+    )
+
+    ruslan["nrm"] = (
+        ruslan["nrm"]
+        .astype(str)
+        .str.replace("‐", "-", regex=False)
+        .str.replace("‑", "-", regex=False)
+        .str.replace("’", "'", regex=False)
+    )
+
+    aligned = []
+    failed_alignment = 0
+
+    for row in tqdm(
+        ruslan[["id", "nrm"]].itertuples(index=False),
+        total=len(ruslan),
+        desc="Совмещаем текст и MFA",
+    ):
+        tokens = word_df[word_df["id"] == row.id].copy()
+
+        if len(tokens) == 0:
+            failed_alignment += 1
+            continue
+
+        tokens = align_text_and_textgrid(tokens, row.nrm)
+
+        if "label_raw" not in tokens.columns:
+            failed_alignment += 1
+            continue
+
+        tokens = add_pause_labels(tokens)
+        aligned.append(tokens)
+
+    if not aligned:
+        raise RuntimeError(
+            "Не удалось собрать ни одного utterance. "
+            "Проверьте пути к metadata и RUSLAN_align_v2."
+        )
+
+    full = pd.concat(aligned, ignore_index=True)
+
+    # Decide which utterances have obviously suspicious segmentation.
+    keep_ids = []
+    reasons = {"too_short": 0, "too_dense": 0}
+
+    for wave_id, group in full.groupby("id", sort=False):
+        ok, reason = is_good_utterance(group)
+
+        if ok:
+            keep_ids.append(wave_id)
+        else:
+            reasons[reason] += 1
+
+    before_utterances = full["id"].nunique()
+    before_tokens = len(full)
+
+    pause_df = full[full["id"].isin(keep_ids)].copy()
+
+    # Silence rows are removed; all pause information is already stored
+    # on the preceding word.
+    pause_df = pause_df[pause_df["label"].astype(str) != ""].copy()
+    pause_df = pause_df[pause_df["label_raw"].notna()].copy()
+    pause_df.reset_index(drop=True, inplace=True)
+
+    pause_df["is_last_word"] = pause_df["is_last_word"].astype(int)
+    pause_df["is_pause_after"] = pause_df["is_pause_after"].astype(int)
+
+    # Fixed 80/20 split from the assignment: id divisible by 5 -> test.
+    numeric_id = (
+        pause_df["id"]
+        .str.split("_", expand=True)[0]
+        .astype(int)
+    )
+
+    pause_df["set"] = "train"
+    pause_df.loc[numeric_id % 5 == 0, "set"] = "test"
+
+    columns = [
+        "id",
+        "label",
+        "label_raw",
+        "duration",
+        "is_last_word",
+        "is_pause_after",
+        "pause_duration",
+        "set",
+    ]
+
+    pause_df[columns].to_csv(
+        RESULT_PATH,
+        sep="|",
+        index=False,
+        header=True,
+        encoding="utf-8",
+        quoting=csv.QUOTE_NONE,
+    )
+
+    print()
+    print("До фильтрации:")
+    print(
+        f"  {before_utterances} предложений, "
+        f"{before_tokens} интервалов"
+    )
+    print()
+    print("Фильтрация:")
+    print(f"  failed_alignment: {failed_alignment}")
+    print(f"  too_short (<{MIN_WORDS} слов): {reasons['too_short']}")
+    print(
+        f"  too_dense (>{MAX_PAUSE_DENSITY:.0%} внутренних пауз): "
+        f"{reasons['too_dense']}"
+    )
+    print()
+    print("После фильтрации:")
+    print(
+        f"  {pause_df['id'].nunique()} предложений, "
+        f"{len(pause_df)} слов"
+    )
+
+    for split in ["train", "test"]:
+        part = pause_df[pause_df["set"] == split]
+        print(
+            f"  {split}: {len(part)} токенов, "
+            f"доля пауз {part['is_pause_after'].mean():.3f}"
+        )
+
+    print(f"\nSaved to {RESULT_PATH}")
 
 
-    # Splitting into train and test deterministically: All the files with index, ending with 0 or 5 is considered test
-    pause_df['set'] = 'train'
-    pause_df.loc[pause_df.id.str.split('_', expand=True)[0].astype(int)%5==0, 'set'] = 'test'
-    pause_df.to_csv(f'{RESULT_PATH}', sep='|', index=False, header=True, quoting=csv.QUOTE_NONE)
-    
-if __name__=='__main__':
+if __name__ == "__main__":
     main()
