@@ -36,11 +36,57 @@ if __name__ == "__main__":
 
     raw = pd.read_csv(INPUT_PATH, names=["id", "raw"], **CSV_KWARGS)
 
-    raw["nrm"] = raw["raw"].apply(normalizer.normalize)
-    clean = raw[raw["nrm"].apply(text_filter.filter) == 1]
+    # Оценим корпус до нормализации.
+    raw["before_ok"] = raw["raw"].apply(text_filter.filter)
 
-    print(f"Num rows before cleaning: {len(raw)}; after cleaning: {len(clean)}")
+    # Сначала normalizer, затем filter — как требуется в лабораторной.
+    raw["nrm"] = raw["raw"].apply(normalizer.normalize)
+    raw["after_ok"] = raw["nrm"].apply(text_filter.filter)
+
+    before_normalized = int(raw["before_ok"].sum())
+    after_normalized = int(raw["after_ok"].sum())
+    rescued = int(
+        ((raw["before_ok"] == 0) & (raw["after_ok"] == 1)).sum()
+    )
+
+    total = len(raw)
+
+    print(f"Загружено {total} записей")
+    print()
+    print("До нормализации:")
+    print(
+        f"  Нормализованных: {before_normalized} "
+        f"({before_normalized / total * 100:.2f}%)"
+    )
+    print(
+        f"  Ненормализованных: {total - before_normalized} "
+        f"({(total - before_normalized) / total * 100:.2f}%)"
+    )
+    print()
+    print("После нормализации:")
+    print(
+        f"  Нормализованных: {after_normalized} "
+        f"({after_normalized / total * 100:.2f}%)"
+    )
+    print(
+        f"  Ненормализованных: {total - after_normalized} "
+        f"({(total - after_normalized) / total * 100:.2f}%)"
+    )
+    print()
+    print(
+        "Удалось исправить для прохождения фильтра: "
+        f"{rescued} предложений"
+    )
+    print(
+        "Остались ненормализованными: "
+        f"{total - after_normalized} предложений"
+    )
+
+    clean = raw[raw["after_ok"] == 1]
 
     clean[["id", "raw", "nrm"]].to_csv(
-        OUTPUT_PATH, index=False, header=False, **CSV_KWARGS
+        OUTPUT_PATH,
+        index=False,
+        header=False,
+        **CSV_KWARGS,
     )
