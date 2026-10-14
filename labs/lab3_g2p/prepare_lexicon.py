@@ -20,25 +20,61 @@ Run from the lab directory::
 
     python prepare_lexicon.py
 """
+
+from __future__ import annotations
+
 import csv
 import glob
 import os
+from pathlib import Path
 import pandas as pd
 import unicodedata
 from collections import Counter, defaultdict
 
 from praatio import textgrid
-import tqdm
+from tqdm import tqdm
 
-ALIGN_DIR = '../../data/RUSLAN_22050_align_v2/'
-NORMALIZED_META = '../../data/metadata_RUSLAN_22200_normalized.csv'
-TOKENS_PATH = 'data/tokens_phones.csv'
-TOKENS_SIL_PATH = 'data/tokens_phones_sil.csv'
-LEXICON_PATH = 'data/lexicon.csv'
 
-SIL = '<SIL>'
-LENGTH_MARK = 'ː'
+ALIGN_DIR = Path("../../data/RUSLAN_align_v2")
+NORMALIZED_META = Path("../../data/metadata_RUSLAN_22200_normalized.csv")
+TOKENS_PATH = Path("data/tokens_phones.csv")
+TOKENS_SIL_PATH = Path("data/tokens_phones_sil.csv")
+LEXICON_PATH = Path("data/lexicon.csv")
+
+SIL = "<SIL>"
+LENGTH_MARK = "ː"
 TEST_EVERY = 5  # lab 2's split rule: test iff the utterance number divides by 5
+
+
+def normalize_phone(phone: str) -> str:
+    """Привести обозначение фонемы к тому же виду, что используется дальше"""
+
+    phone = unicodedata.normalize("NFC", str(phone))
+    return phone.replace(LENGTH_MARK, "")
+
+
+def read_kept_ids(path: Path) -> set[str] | None:
+    """Utterance ids that survived the lab 1 filter, or None if the file is absent.
+
+    The alignment was built on **raw** text, so it contains utterances a normalizer would
+    reject — including three all-caps abbreviations whose transcriptions `mfa g2p` invented
+    (`кпсс` → `k r ə f ɨ s̪`). Restricting to the lab 1 output removes them.
+    """
+
+    if not path.exists():
+        print(f"{path} не найден")
+        print("Будут использованы все TextGrid")
+        return None
+
+    kept = set()
+
+    with path.open("r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                kept.add(line.split("|", 1)[0])
+
+    return kept
 
 
 def phones_of_token(phones: list[tuple[float, float, str]],
@@ -66,21 +102,88 @@ def phones_of_token(phones: list[tuple[float, float, str]],
     return out
 
 
-def read_kept_ids(path: str) -> set[str] | None:
-    """Utterance ids that survived the lab 1 filter, or None if the file is absent.
+def read_one_textgrid(
+    path: Path,
+    keep_sil: bool,
+) -> tuple[list[dict], bool]:
+    """Прочитать один TextGrid и вернуть строки будущей таблицы"""
 
-    The alignment was built on **raw** text, so it contains utterances a normalizer would
-    reject — including three all-caps abbreviations whose transcriptions `mfa g2p` invented
-    (`кпсс` → `k r ə f ɨ s̪`). Restricting to the lab 1 output removes them.
-    """
-    if not os.path.isfile(path):
-        print(f'{path} not found: keeping every aligned utterance')
-        return None
-    with open(path, encoding='utf-8') as fh:
-        return {line.split('|', 1)[0] for line in fh if line.strip()}
+    utterance_id = path.stem
+
+    try:
+        tg = textgrid.openTextgrid(
+            str(path),
+            includeEmptyIntervals=True,
+        )
+        word_tier = tg.getTier("words")
+        phone_tier = tg.getTier("phones")
+    except Exception as exc:
+        print(f"Не удалось прочитать {utterance_id}: {exc}")
+        return [], False
+
+    phone_entries = [
+        (entry.start, entry.end, entry.label)
+        for entry in phone_tier.entries
+    ]
+
+    # Использую то же правило train/test, что и в предыдущей лабораторной
+    fold = (
+        "test"
+        if int(utterance_id.split("_")[0]) % TEST_EVERY == 0
+        else "train"
+    )
+
+    rows = []
+    token_id = 0
+    has_spn = False
+
+    for entry in word_tier.entries:
+        # Пустой интервал words означает паузу
+        if entry.label == "":
+            if not keep_sil:
+                continue
+
+            rows.append({
+                "id": utterance_id,
+                "token_id": token_id,
+                "token": SIL,
+                "phones": SIL,
+                "set": fold,
+            })
+            token_id += 1
+            continue
+
+        phones = phones_of_token(
+            phone_entries,
+            entry.start,
+            entry.end,
+        )
+
+        if "spn" in phones:
+            has_spn = True
+
+        token = unicodedata.normalize(
+            "NFC",
+            str(entry.label),
+        ).lower()
+
+        rows.append({
+            "id": utterance_id,
+            "token_id": token_id,
+            "token": token,
+            "phones": " ".join(phones),
+            "set": fold,
+        })
+        token_id += 1
+
+    return rows, has_spn
 
 
-def read_alignment(align_root: str, keep: set[str] | None, keep_sil=False) -> list[dict]:
+def read_alignment(
+    align_root: Path,
+    keep: set[str] | None,
+    keep_sil: bool = False,
+) -> tuple[list[dict], dict[str, int]]:
     """Read every TextGrid in `align_root` into per-token records.
 
     Args:
@@ -91,38 +194,49 @@ def read_alignment(align_root: str, keep: set[str] | None, keep_sil=False) -> li
     Returns:
         One dict per aligned token with keys `id`, `token_id`, `token`, `phones`, `set`.
     """
-    rows = []
-    print(sorted(glob.glob(os.path.join(align_root, '*.TextGrid'))))
-    for path in tqdm.tqdm(sorted(glob.glob(os.path.join(align_root, '*.TextGrid')))):
-        utterance_id = os.path.basename(path)[:-len('.TextGrid')]
-        if keep is not None and utterance_id not in keep:
-            continue
-        try:
-            tg = textgrid.openTextgrid(path, True)
-        except Exception as exc:
-            print(f'Failed to read {utterance_id}: {exc}')
-            continue
-        word_tier, phone_tier = tg.tiers
-        phones = [(p.start, p.end, p.label) for p in phone_tier.entries]
-        fold = 'test' if int(utterance_id.split('_')[0]) % TEST_EVERY == 0 else 'train'
 
-        token_id = 0
-        for entry in word_tier.entries:
-            if entry.label == '':
-                if not keep_sil:
-                    continue
-                current_phones = '<SIL>'
-            else:
-                current_phones = ' '.join(phones_of_token(phones, entry.start, entry.end))
-            rows.append({
-                'id': utterance_id,
-                'token_id': token_id,
-                'token': unicodedata.normalize('NFC', entry.label),
-                'phones': current_phones,
-                'set': fold,
-            })
-            token_id += 1
-    return rows
+    paths = sorted(align_root.glob("*.TextGrid"))
+
+    if not paths:
+        raise FileNotFoundError(
+            f"В {align_root} не найдено ни одного .TextGrid"
+        )
+
+    rows = []
+    stats = {
+        "all_textgrids": len(paths),
+        "not_in_normalized": 0,
+        "failed": 0,
+        "spn_utterances": 0,
+        "kept_utterances": 0,
+    }
+
+    for path in tqdm(paths, desc="Читаем TextGrid"):
+        utterance_id = path.stem
+
+        if keep is not None and utterance_id not in keep:
+            stats["not_in_normalized"] += 1
+            continue
+
+        utterance_rows, has_spn = read_one_textgrid(
+            path,
+            keep_sil=keep_sil,
+        )
+
+        if not utterance_rows:
+            stats["failed"] += 1
+            continue
+
+        # spn не даёт нормальной фонемной транскрипции
+        # Поэтому по условию убираю всё предложение целиком
+        if has_spn:
+            stats["spn_utterances"] += 1
+            continue
+
+        rows.extend(utterance_rows)
+        stats["kept_utterances"] += 1
+
+    return rows, stats
 
 
 def build_lexicon(rows: list[dict]) -> dict[str, Counter]:
@@ -135,45 +249,135 @@ def build_lexicon(rows: list[dict]) -> dict[str, Counter]:
     make the reported PER meaningless.
     """
     lexicon: dict[str, Counter] = defaultdict(Counter)
+
     for row in rows:
-        if row['set'] != 'train':
+        # Test здесь использовать нельзя, иначе его слова заранее попадут в словарь
+        if row["set"] != "train":
             continue
-        phones = row['phones'].split()
-        if not phones or 'spn' in phones:
+
+        word = row["token"]
+        phones = row["phones"].split()
+
+        if word == SIL or not phones or "spn" in phones:
             continue
-        lexicon[row['token']][row['phones']] += 1
+
+        lexicon[word][row["phones"]] += 1
+
     return lexicon
+
+
+def print_stats(
+    rows: list[dict],
+    stats: dict[str, int],
+    title: str,
+) -> None:
+    """Напечатать короткую проверку подготовленных данных"""
+
+    df = pd.DataFrame(rows)
+
+    print()
+    print(title)
+    print("-" * len(title))
+    print(f"TextGrid всего: {stats['all_textgrids']}")
+    print(f"Не было после нормализации: {stats['not_in_normalized']}")
+    print(f"Не удалось прочитать: {stats['failed']}")
+    print(f"Удалено из-за spn: {stats['spn_utterances']}")
+    print(f"Оставлено предложений: {stats['kept_utterances']}")
+    print(f"Строк в таблице: {len(df)}")
+
+    if len(df):
+        print()
+        print(df["set"].value_counts())
 
 
 def main() -> None:
     """Read the alignment, write the training table and the lexicon."""
-    rows = read_alignment(ALIGN_DIR, read_kept_ids(NORMALIZED_META), keep_sil=False)
-    utterances = {r['id'] for r in rows}
-    test = {r['id'] for r in rows if r['set'] == 'test'}
-    print(f'{len(rows)} tokens in {len(utterances)} utterances '
-          f'({len(test)} test, {len(test) / max(len(utterances), 1):.1%})')
+    Path("data").mkdir(exist_ok=True)
+    kept_ids = read_kept_ids(NORMALIZED_META)
 
-    os.makedirs(os.path.dirname(TOKENS_PATH), exist_ok=True)
+    # Эта версия нужна для обучения и оценки G2P
+    rows, stats = read_alignment(
+        ALIGN_DIR,
+        kept_ids,
+        keep_sil=False,
+    )
 
-    pd.DataFrame(rows).to_csv(TOKENS_PATH, encoding='utf-8', quoting=csv.QUOTE_NONE, sep='|', index=False, header=True)
-    pd.DataFrame(
-        read_alignment(ALIGN_DIR, read_kept_ids(NORMALIZED_META), keep_sil=True)
-        ).to_csv(TOKENS_SIL_PATH, encoding='utf-8', quoting=csv.QUOTE_NONE, sep='|', index=False, header=True)
-    
-    
+    # Эта версия нужна дальше, потому что в ней остаются паузы
+    rows_sil, stats_sil = read_alignment(
+        ALIGN_DIR,
+        kept_ids,
+        keep_sil=True,
+    )
+
+    if not rows:
+        raise RuntimeError("После обработки не осталось данных")
+
+    tokens_df = pd.DataFrame(rows)
+    tokens_sil_df = pd.DataFrame(rows_sil)
+
+    tokens_df.to_csv(
+        TOKENS_PATH,
+        sep="|",
+        index=False,
+        encoding="utf-8",
+        quoting=csv.QUOTE_NONE,
+    )
+
+    tokens_sil_df.to_csv(
+        TOKENS_SIL_PATH,
+        sep="|",
+        index=False,
+        encoding="utf-8",
+        quoting=csv.QUOTE_NONE,
+    )
+
     lexicon = build_lexicon(rows)
 
-    variants = sum(1 for counts in lexicon.values() if len(counts) > 1)
-    print(f'lexicon from the train fold: {len(lexicon)} types, '
-          f'{variants} with several pronunciations')
+    with LEXICON_PATH.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+        writer = csv.writer(
+            file,
+            delimiter="|",
+            quoting=csv.QUOTE_NONE,
+        )
+        writer.writerow(["word", "phones", "count"])
 
-    with open(LEXICON_PATH, 'w', encoding='utf-8', newline='') as fh:
-        writer = csv.writer(fh, delimiter='|', quoting=csv.QUOTE_NONE)
-        writer.writerow(['word', 'phones', 'count'])
         for word in sorted(lexicon):
             for phones, count in lexicon[word].most_common():
                 writer.writerow([word, phones, count])
 
+    print_stats(rows, stats, "Таблица без пауз")
 
-if __name__ == '__main__':
+    print()
+    print("Таблица с паузами")
+    print("-----------------")
+    print(f"Строк: {len(tokens_sil_df)}")
+    print(
+        f"Токенов <SIL>: "
+        f"{(tokens_sil_df['token'] == SIL).sum()}"
+    )
+
+    variants = sum(
+        1
+        for pronunciations in lexicon.values()
+        if len(pronunciations) > 1
+    )
+
+    print()
+    print("Словарь")
+    print("-------")
+    print(f"Слов: {len(lexicon)}")
+    print(f"Слов с несколькими произношениями: {variants}")
+
+    print()
+    print("Сохранено:")
+    print(f"  {TOKENS_PATH}")
+    print(f"  {TOKENS_SIL_PATH}")
+    print(f"  {LEXICON_PATH}")
+
+
+if __name__ == "__main__":
     main()
